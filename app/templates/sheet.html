@@ -35,7 +35,9 @@
       </tr>
       {% for r in rows %}
       <tr>
-        <td><b>{{ r.id }}</b><br><span class="muted small">{{ r.name }}</span></td>
+        <td><b>{{ r.id }}</b><br><span class="muted small">{{ r.name }}</span>
+          {% if r.calibration %}<br><span class="tag info">已校准</span>{% endif %}
+        </td>
         <td>{{ r.entry.replace('T',' ') }}</td>
         <td>{{ r.rest.replace('T',' ') }}</td>
         <td>
@@ -56,6 +58,13 @@
     <p class="muted small" style="margin-top:6px">
       “需等待 N 分”表示按建议安全时刻执行：露点差、升温率、相对湿度变化率
       全部连续 30 分钟达标后方可操作；标“已执行”者取自封存事件。
+      {% if calibrations %}
+      <br>记录仪时间校准：
+      {% for cid, v in calibrations.items() %}
+        {{ cid }} 校准 v{{ v.id }}（{{ v.note }}）{{ "；" if not loop.last }}
+      {% endfor %}
+      —— 实测曲线已按确认映射对齐，原始记录未改动。
+      {% endif %}
     </p>
   </section>
 

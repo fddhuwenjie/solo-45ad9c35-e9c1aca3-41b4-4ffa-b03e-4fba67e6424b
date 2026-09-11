@@ -266,11 +266,16 @@ def _rh_rate(minute, m):
 # ---------------------------------------------------------------- 记录仪
 
 def attach_logger(series, rows, tol_min=OUT_STEP_MIN):
-    """把实测点就近贴到输出网格；rows 已按单箱过滤并排序。"""
+    """把实测点就近贴到输出网格；rows 已按单箱过滤并排序。
+
+    校准后的行带有 raw_dt（原始记录仪时间），一并透传到网格点，
+    供界面并排显示原始/校准时间。
+    """
     if not rows:
         for p in series:
             p["t_meas"] = None
             p["rh_meas"] = None
+            p["meas_raw_time"] = None
         return
     idx = 0
     rows = sorted(rows, key=lambda r: r["dt"])
@@ -287,9 +292,12 @@ def attach_logger(series, rows, tol_min=OUT_STEP_MIN):
         if best is not None and best_d <= tol_min:
             p["t_meas"] = best["temp"]
             p["rh_meas"] = best["rh"]
+            raw = best.get("raw_dt")
+            p["meas_raw_time"] = fmt_dt(raw) if raw else None
         else:
             p["t_meas"] = None
             p["rh_meas"] = None
+            p["meas_raw_time"] = None
 
 
 def logger_gaps(rows, threshold_min=DEFAULT_GAP_MIN):
@@ -667,7 +675,14 @@ def parse_logger_rows(raw):
     return rows
 
 
-def calculate(trip, raw_logger=None):
+def calculate(trip, raw_logger=None, calibrations=None, only_cases=None):
+    """整趟计算。
+
+    calibrations: {case_id: 已确认的校准映射}，仅这些映射参与重排，
+        原始 logger_rows 不被修改（映射在副本上应用）。
+    only_cases: 可选的箱号集合；给出时只重算这些箱（校准映射变动时
+        只重算该记录仪覆盖的箱/阶段），其余箱结果由调用方保留。
+    """
     phases = _sorted_phases(trip)
     if not phases:
         raise ValueError("至少需要一个路线阶段")
@@ -682,6 +697,18 @@ def calculate(trip, raw_logger=None):
     if raw_logger:
         for r in parse_logger_rows(raw_logger):
             logger.setdefault(r["case_id"], []).append(r)
+
+    # 应用已确认的校准映射（在解析副本上，不改原始记录）
+    calibrations = calibrations or {}
+    cal_ranges = {}
+    if calibrations:
+        from . import calibration as _cal
+        for cid, mapping in calibrations.items():
+            if cid in logger and mapping:
+                logger[cid] = _cal.apply_to_rows(logger[cid], mapping)
+                dts = [r["dt"] for r in logger[cid]]
+                if dts:
+                    cal_ranges[cid] = (min(dts), max(dts))
 
     gap_threshold = int(trip.get("gap_threshold_min", DEFAULT_GAP_MIN))
     dev_t = float(trip.get("deviation_temp", DEFAULT_DEV_T))
@@ -699,6 +726,8 @@ def calculate(trip, raw_logger=None):
     earliest = None
     for case in trip.get("cases", []):
         cid = str(case.get("id"))
+        if only_cases is not None and cid not in only_cases:
+            continue  # 局部重算：跳过未受校准变动影响的箱
         series = calculate_case(case, phases, t_start, t_end)
         rows = logger.get(cid, [])
         attach_logger(series, rows)
@@ -708,6 +737,12 @@ def calculate(trip, raw_logger=None):
         mult = None
         if deviation:
             mult = fit_tau_multiplier(case, phases, t_start, t_end, rows)
+        cal_info = None
+        if cid in calibrations and calibrations[cid]:
+            from . import calibration as _cal
+            lo, hi = cal_ranges.get(cid, (None, None))
+            cal_info = {"applied": True,
+                        "covered_phases": _cal.covered_phases(phases, lo, hi)}
         cases_out[cid] = {
             "id": cid,
             "name": case.get("name", cid),
@@ -719,6 +754,8 @@ def calculate(trip, raw_logger=None):
             "deviation": deviation,
             "fitted_tau_multiplier": mult,
             "nodes": {n["type"]: n["time"] for n in case.get("nodes", [])},
+            "calibrated": cid in calibrations,
+            "calibration": cal_info,
         }
         for r in ana["risks"]:
             if r["severity"] == "danger" and (

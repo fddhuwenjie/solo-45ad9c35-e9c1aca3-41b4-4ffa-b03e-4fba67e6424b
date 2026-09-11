@@ -36,6 +36,7 @@ var Editor = (function () {
     if (activeTab === "phases") renderPhases(d);
     else if (activeTab === "cases") renderCases(d);
     else if (activeTab === "logger") renderLogger(d);
+    else if (activeTab === "calib") Calib.render(root);
     else renderJson(d);
   }
 
@@ -261,6 +262,15 @@ var Editor = (function () {
         .then(function (txt) { ingestText(txt); });
     });
     btns.appendChild(loadSample);
+    var loadDrift = ce("button", "btn btn-mini",
+      "载入漂移示例 CSV（时区+走时漂移）");
+    loadDrift.title = "C-02 时区未调、C-03 时钟漂移，用于时间校准演示";
+    loadDrift.addEventListener("click", function () {
+      fetch("/api/sample/logger-drift.csv")
+        .then(function (r) { return r.text(); })
+        .then(function (txt) { ingestText(txt); });
+    });
+    btns.appendChild(loadDrift);
     if (rows.length) {
       var clr = ce("button", "btn btn-mini", "清除实测数据");
       clr.addEventListener("click", function () {
@@ -305,6 +315,13 @@ var Editor = (function () {
         Object.keys(res.by_case).map(function (k) {
           return k + "×" + res.by_case[k];
         }).join("，");
+      // 时区/固定偏移列预填到校准工作区
+      if (res.offsets && Object.keys(res.offsets).length &&
+          window.Calib) {
+        Calib.prefillOffsets(res.offsets);
+        csvStatus += "；检测到 " + Object.keys(res.offsets).length +
+          " 台记录仪带时区/偏移列，已预填到“时间校准”";
+      }
       setLogger(norm, csvStatus);
     });
   }

@@ -193,3 +193,36 @@ def logger_csv_text():
     w.writerow(["case_id", "timestamp", "temp", "rh"])
     w.writerows(build_logger_rows())
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------- 漂移示例
+
+def drift_logger_csv_text():
+    """带时钟问题的记录仪 CSV：演示时间校准工作区。
+
+    * C-02 记录仪留在出发地时区，全部时间戳晚了 8 小时
+      （CSV 内 tz_offset_min=-480 供导入时预填）；
+    * C-03 记录仪电池亏电走时不准：相对装车时刻线性漂移，
+      到 22:00 已走快约 75 分钟，且手记人员按当地时间记录，
+      需要"装车/到馆"两个手记事件锚点才能对齐；
+    * C-01、C-04 时钟正常。
+    """
+    rows = build_logger_rows()
+    out = []
+    t0 = thermal.parse_dt(f"{D}T06:00")
+    for cid, ts, temp, rh in rows:
+        dt = thermal.parse_dt(ts)
+        tz_col = ""
+        if cid == "C-02":
+            dt = dt + timedelta(hours=8)
+            tz_col = "-480"
+        elif cid == "C-03":
+            elapsed = (dt - t0).total_seconds() / 60.0
+            dt = dt + timedelta(minutes=elapsed * 75.0 / 960.0)
+        out.append([cid, dt.strftime(thermal.DT_FMT), temp, rh, tz_col, ""])
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["case_id", "timestamp", "temp", "rh",
+                "tz_offset_min", "fixed_offset_min"])
+    w.writerows(out)
+    return buf.getvalue()

@@ -178,6 +178,13 @@ var Charts = (function () {
       var m = q.t_meas != null ? " / 实测 " + q.t_meas + "°C" : "";
       html += "<tr><td style='color:" + state.colorOf[cid] +
         "'>●</td><td>" + cid + "</td><td>" + q.t_in + "°C" + m + "</td></tr>";
+      // 校准后的实测点并排显示原始记录仪时间
+      if (q.t_meas != null && q.meas_raw_time &&
+          q.meas_raw_time !== q.time) {
+        html += "<tr><td></td><td></td><td class='raw-note'>原始 " +
+          q.meas_raw_time.replace("T", " ") + " → 校准 " +
+          q.time.replace("T", " ") + "</td></tr>";
+      }
     });
     return html + "</table>";
   }
@@ -480,13 +487,17 @@ var Charts = (function () {
 
   function drawLegend(box, caseIds, result, colorOf) {
     if (!box) return;
+    var calVers = result.calibration_versions || {};
     box.innerHTML =
       '<span class="lg"><span class="sw" style="background:#8a97a3"></span>环境温度</span>' +
       '<span class="lg"><span class="sw dash" style="color:#8a97a3"></span>环境露点</span>' +
       caseIds.map(function (cid) {
+        var cal = calVers[cid]
+          ? ' <span class="tag info">校准 v' + calVers[cid] + "</span>"
+          : "";
         return '<span class="lg"><span class="sw" style="background:' +
           colorOf[cid] + '"></span>' + cid + " " +
-          escapeHtml(result.cases[cid].name) + "</span>";
+          escapeHtml(result.cases[cid].name) + cal + "</span>";
       }).join("");
   }
 

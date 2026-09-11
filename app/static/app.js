@@ -3,6 +3,9 @@
 (function () {
   var doc = null, result = null, versions = [], code = null;
   var calcTimer = null;
+  // 已确认的校准映射（只有确认版参与重排）与全部校准版本
+  var calibrations = {};        // case_id -> {version_id, mapping, ...}
+  var calibrationVersions = []; // 全部校准版本（含已撤销）
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -30,15 +33,76 @@
       code = j.trip_code;
       doc = j.document;
       versions = j.versions;
+      calibrations = {};
+      calibrationVersions = [];
       $("trip-code").textContent = code;
       $("link-sheet").href = "/sheet/" + encodeURIComponent(code);
-      Editor.mount($("editor"), function () { return doc; }, scheduleCalc);
-      Editor.render();
+      mountEditors();
       renderVersions();
       enableUI(true);
+      loadCalibrations();
       calculate(true);
     }).catch(flashErr);
   });
+
+  function mountEditors() {
+    Editor.mount($("editor"), function () { return doc; }, scheduleCalc);
+    Calib.mount({
+      getDoc: function () { return doc; },
+      getCode: function () { return code; },
+      getCalibrations: function () { return calibrations; },
+      getCalibrationVersions: function () { return calibrationVersions; },
+      api: api,
+      onCalibrated: onCalibrated,
+    });
+    Editor.render();
+  }
+
+  function loadCalibrations() {
+    if (!code) return;
+    api("/api/trip/" + encodeURIComponent(code) + "/calibrations")
+      .then(function (j) {
+        calibrations = j.confirmed || {};
+        calibrationVersions = j.versions || [];
+      }).catch(function () { /* 无校准版本时忽略 */ });
+  }
+
+  // 校准确认/撤销后：只合并该箱的重算结果，其余箱保持不变
+  function onCalibrated(caseResult, calPayload) {
+    calibrations = calPayload.confirmed || {};
+    calibrationVersions = calPayload.versions || [];
+    if (result && caseResult) {
+      result.cases[caseResult.id] = caseResult;
+      recomputeEarliest();
+      renderAll();
+    }
+  }
+
+  function recomputeEarliest() {
+    var earliest = null;
+    Object.keys(result.cases).forEach(function (cid) {
+      var co = result.cases[cid];
+      co.risks.forEach(function (r) {
+        if (r.severity === "danger" &&
+            (!earliest || r.start < earliest.time)) {
+          earliest = { time: r.start, case_id: cid, case_name: co.name,
+                       kind: r.kind, message: r.message };
+        }
+      });
+    });
+    if (!earliest) {
+      Object.keys(result.cases).forEach(function (cid) {
+        var co = result.cases[cid];
+        co.risks.forEach(function (r) {
+          if (!earliest || r.start < earliest.time) {
+            earliest = { time: r.start, case_id: cid, case_name: co.name,
+                         kind: r.kind, message: r.message };
+          }
+        });
+      });
+    }
+    result.earliest = earliest;
+  }
 
   function flashErr(e) {
     var b = $("risk-banner");
@@ -57,7 +121,9 @@
   function calculate(persist) {
     if (!doc) return;
     var tasks = [api("/api/calculate", {
-      method: "POST", body: JSON.stringify({ document: doc }),
+      method: "POST",
+      body: JSON.stringify({ document: doc,
+                             calibrations: calibMappings() }),
     })];
     if (persist) {
       tasks.push(api("/api/trip/" + encodeURIComponent(code) + "/document",
@@ -75,8 +141,22 @@
     });
   }
 
+  function calibMappings() {
+    var out = {};
+    Object.keys(calibrations).forEach(function (cid) {
+      out[cid] = calibrations[cid].mapping;
+    });
+    return out;
+  }
+
   // ------------------------------------------------------------ 渲染
   function renderAll() {
+    // 路线时间带图例注明各校准版本
+    var calVersions = {};
+    Object.keys(calibrations).forEach(function (cid) {
+      calVersions[cid] = calibrations[cid].version_id;
+    });
+    result.calibration_versions = calVersions;
     Charts.render($("charts"), result, doc, {
       onNodeDrag: handleNodeDrag,
       onNodeDragEnd: function () { calculate(true); },
@@ -194,9 +274,13 @@
       (doc.events || []).forEach(function (e) {
         if (e.case_id === c.id) events[e.type] = e.time;
       });
+      var cal = calibrations[c.id];
 
       html += "<tr><td><b>" + esc(c.id) + "</b><br>" +
-        '<span class="muted small">' + esc(c.name) + "</span></td>";
+        '<span class="muted small">' + esc(c.name) + "</span>" +
+        (cal ? '<br><span class="tag info" title="' +
+          esc(cal.note || "") + "">校准 v" + cal.version_id + "</span>"
+          : "") + "</td>";
       html += "<td>" + short(nodes.entry) + "</td>";
       html += "<td>" + short(nodes.rest) + "</td>";
       var rest = co.rest;
@@ -326,8 +410,7 @@
     }).then(function (j) {
       doc = j.document;
       versions = j.versions;
-      Editor.mount($("editor"), function () { return doc; }, scheduleCalc);
-      Editor.render();
+      mountEditors();
       renderVersions();
       calculate(false);
       var b = $("risk-banner");
@@ -401,11 +484,17 @@
                    temp: r.temp, rh: r.rh };
         });
         doc.logger_rows = rows;
-        Editor.mount($("editor"), function () { return doc; }, scheduleCalc);
-        Editor.setLogger(rows, "✅ 从 " + f.name + " 解析 " + res.count +
+        mountEditors();
+        var status = "✅ 从 " + f.name + " 解析 " + res.count +
           " 条：" + Object.keys(res.by_case).map(function (k) {
             return k + "×" + res.by_case[k];
-          }).join("，"));
+          }).join("，");
+        // 时区/固定偏移列预填到校准工作区
+        if (res.offsets && Object.keys(res.offsets).length) {
+          Calib.prefillOffsets(res.offsets);
+          status += "；含时区/偏移列，已预填到“时间校准”";
+        }
+        Editor.setLogger(rows, status);
         calculate(true);
       });
     ev.target.value = "";
@@ -415,7 +504,8 @@
     fetch("/api/params", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ document: doc }),
+      body: JSON.stringify({ document: doc,
+                             calibrations: calibMappings() }),
     }).then(function (r) { return r.blob(); }).then(function (blob) {
       var a = document.createElement("a");
       a.href = URL.createObjectURL(blob);

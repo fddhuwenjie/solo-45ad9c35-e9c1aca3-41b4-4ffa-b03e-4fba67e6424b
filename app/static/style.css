@@ -206,6 +206,35 @@ textarea.jsonbox {
 
 .logger-summary { font-size: 12px; color: var(--ink-soft); margin-bottom: 6px; }
 
+/* ---------- 时间校准工作区 ---------- */
+.calib-chart {
+  width: 100%; background: #fbfcfd;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.calib-anchor { cursor: grab; }
+.calib-anchor:active { cursor: grabbing; }
+.calib-event-row { grid-template-columns: 1fr 1.4fr auto auto; }
+.calib-peak-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 0; border-bottom: 1px dashed var(--line);
+}
+.calib-peak-row .small { flex: 1; }
+.calib-anchor-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 0; flex-wrap: wrap;
+}
+.calib-anchor-row .calib-dt { width: 150px; }
+.calib-anchor-row .calib-label { width: 76px; }
+.calib-conflict {
+  font-size: 12px; padding: 5px 9px; border-radius: 5px; margin: 4px 0;
+}
+.calib-conflict.err { background: var(--danger-soft); color: #7c2318; }
+.calib-conflict.ok { background: var(--ok-soft); color: #1d5c38; }
+.calib-pairs { max-height: 220px; overflow: auto; }
+.calib-pairs .calib-out { color: var(--danger); font-size: 12px; }
+.calib-actions { gap: 8px; align-items: center; }
+.raw-note { font-size: 11px; color: #ffd98a; }
+
 /* ---------- 版本 ---------- */
 .version-list { padding-left: 20px; margin: 0; font-size: 13px; }
 .version-list li { margin-bottom: 6px; }

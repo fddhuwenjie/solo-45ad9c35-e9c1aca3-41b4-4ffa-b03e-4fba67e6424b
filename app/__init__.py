@@ -10,6 +10,7 @@ from datetime import timedelta
 from flask import (Flask, Response, jsonify, render_template, request,
                    send_from_directory)
 
+from . import calibration as calib
 from . import sample_data, storage, thermal
 
 SAMPLE_CODE = "WX-2026-0115"
@@ -45,8 +46,13 @@ def create_app(db_path=None):
         if tid is None:
             return "行程不存在", 404
         doc = storage.load_document(c, tid)
-        result = thermal.calculate(doc, doc.get("logger_rows"))
+        confirmed = _confirmed_calibrations(c, tid)
+        result = thermal.calculate(
+            doc, doc.get("logger_rows"),
+            calibrations={cid: v["mapping"]
+                          for cid, v in confirmed.items()})
         ctx = _sheet_context(doc, result)
+        ctx["calibrations"] = confirmed
         vid = request.args.get("v", type=int)
         if vid:
             v = storage.get_version(c, vid)
@@ -55,6 +61,7 @@ def create_app(db_path=None):
                 vres = thermal.calculate(vdoc, vdoc.get("logger_rows"))
                 ctx = _sheet_context(vdoc, vres)
                 ctx["version"] = v
+                ctx["calibrations"] = confirmed
         return render_template("sheet.html", **ctx)
 
     def _sheet_context(doc, result):
@@ -86,6 +93,7 @@ def create_app(db_path=None):
                 "open": open_t, "open_note": open_note,
                 "risks": co.get("risks", []),
                 "rest_info": co.get("rest"),
+                "calibration": co.get("calibration"),
             })
         return {"doc": doc, "result": result, "rows": rows}
 
@@ -97,6 +105,7 @@ def create_app(db_path=None):
         tid = storage.get_or_create_trip(c, doc["code"], doc, doc["title"])
         # 载入即重置样例，保证演示可复现
         storage.save_document(c, tid, doc)
+        storage.delete_calibrations(c, tid)
         versions = storage.list_versions(c, tid)
         return jsonify({"trip_code": doc["code"], "trip_id": tid,
                         "document": doc,
@@ -131,8 +140,14 @@ def create_app(db_path=None):
         doc = payload.get("document")
         if not isinstance(doc, dict):
             return jsonify({"error": "document 必填"}), 400
+        # 只有确认后的校准映射参与重排；草稿映射绝不进入计算
+        calibrations = payload.get("calibrations") or {}
+        only = payload.get("only_cases")
         try:
-            return jsonify(thermal.calculate(doc, doc.get("logger_rows")))
+            return jsonify(thermal.calculate(
+                doc, doc.get("logger_rows"),
+                calibrations=calibrations,
+                only_cases=set(only) if only else None))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
@@ -309,6 +324,155 @@ def create_app(db_path=None):
                         "versions": [_version_brief(v)
                                      for v in storage.list_versions(c, tid)]})
 
+    # ------------------------------------------------------------ 时间校准
+    def _confirmed_calibrations(c, tid):
+        """{case_id: 生效的校准版本记录}。"""
+        out = {}
+        for v in storage.list_calibrations(c, tid):
+            if v["status"] == "confirmed":
+                out[v["case_id"]] = v
+        return out
+
+    def _calibration_payload(c, tid):
+        confirmed = _confirmed_calibrations(c, tid)
+        return {
+            "confirmed": {cid: {"version_id": v["id"],
+                                "mapping": v["mapping"],
+                                "note": v["note"],
+                                "created_at": v["created_at"]}
+                          for cid, v in confirmed.items()},
+            "versions": [{
+                "id": v["id"], "case_id": v["case_id"],
+                "status": v["status"], "note": v["note"],
+                "created_at": v["created_at"],
+                "anchor_count": len(v["mapping"].get("anchors", [])),
+            } for v in storage.list_calibrations(c, tid)],
+        }
+
+    def _logger_dts(doc, cid):
+        rows = [r for r in thermal.parse_logger_rows(doc.get("logger_rows", []))
+                if r["case_id"] == cid]
+        return rows, [r["dt"] for r in rows]
+
+    @app.get("/api/trip/<code>/calibrations")
+    def list_calibrations(code):
+        c = conn()
+        tid = trip_id_or_404(c, code)
+        if tid is None:
+            return jsonify({"error": "trip not found"}), 404
+        return jsonify(_calibration_payload(c, tid))
+
+    @app.post("/api/trip/<code>/calibration/preview")
+    def preview_calibration(code):
+        """草稿映射试算：分段线性映射、残差、冲突与并排时间，不落库。"""
+        payload = request.get_json(force=True)
+        c = conn()
+        tid = trip_id_or_404(c, code)
+        if tid is None:
+            return jsonify({"error": "trip not found"}), 404
+        doc = storage.load_document(c, tid)
+        cid = str(payload.get("case_id", ""))
+        rows, dts = _logger_dts(doc, cid)
+        if not rows:
+            return jsonify({"error": f"{cid} 没有记录仪数据"}), 400
+        m = calib.normalize(payload.get("mapping"))
+        conflicts = calib.validate(m, dts)
+        # 并排显示：原始时间 vs 校准时间（抽样展示，前端可全量拉取）
+        pairs = []
+        step = max(1, len(rows) // 60)
+        for r in rows[::step]:
+            ct = calib.calibrate_dt(m, r["dt"])
+            pairs.append({"raw": thermal.fmt_dt(r["dt"]),
+                          "calibrated": thermal.fmt_dt(ct) if ct else None})
+        return jsonify({
+            "case_id": cid,
+            "base_offset_min": m["base"],
+            "segments": calib.segments(m),
+            "residuals": calib.residuals(m),
+            "conflicts": conflicts,
+            "blocking": bool(calib.blocking(conflicts)),
+            "sample_pairs": pairs,
+            "sample_count": len(rows),
+        })
+
+    @app.post("/api/trip/<code>/calibration/confirm")
+    def confirm_calibration(code):
+        """确认映射：校验通过才版本化；只重算该记录仪覆盖的箱与阶段。"""
+        payload = request.get_json(force=True)
+        c = conn()
+        tid = trip_id_or_404(c, code)
+        if tid is None:
+            return jsonify({"error": "trip not found"}), 404
+        doc = storage.load_document(c, tid)
+        cid = str(payload.get("case_id", ""))
+        if not any(str(x.get("id")) == cid for x in doc.get("cases", [])):
+            return jsonify({"error": "case not found"}), 404
+        rows, dts = _logger_dts(doc, cid)
+        if not rows:
+            return jsonify({"error": f"{cid} 没有记录仪数据"}), 400
+        mapping = payload.get("mapping") or {}
+        m = calib.normalize(mapping)
+        conflicts = calib.validate(m, dts)
+        if calib.blocking(conflicts):
+            return jsonify({"error": "映射存在冲突，未确认",
+                            "conflicts": conflicts}), 400
+        # 版本化只存映射本身，不改原始记录与已封存方案
+        note = payload.get("note") or (
+            f"{cid} 校准：{len(m['anchors'])} 锚点，"
+            f"基准偏移 {m['base']:+.0f} 分钟")
+        vid = storage.add_calibration(c, tid, cid, mapping, note)
+        # 只重算该记录仪覆盖的箱（阶段范围在结果中标注）
+        result = thermal.calculate(doc, doc.get("logger_rows"),
+                                   calibrations={cid: mapping},
+                                   only_cases={cid})
+        return jsonify({
+            "ok": True, "version_id": vid,
+            "case_result": result["cases"][cid],
+            "calibrations": _calibration_payload(c, tid),
+        })
+
+    @app.post("/api/trip/<code>/calibration/revert")
+    def revert_calibration(code):
+        """撤销当前映射，恢复上一版本；曲线对齐与风险位置随之回退。"""
+        payload = request.get_json(force=True)
+        c = conn()
+        tid = trip_id_or_404(c, code)
+        if tid is None:
+            return jsonify({"error": "trip not found"}), 404
+        cid = str(payload.get("case_id", ""))
+        cur, restored = storage.revert_calibration(c, tid, cid)
+        if not cur:
+            return jsonify({"error": "该箱没有可撤销的校准映射"}), 400
+        doc = storage.load_document(c, tid)
+        calibrations = {}
+        if restored:
+            calibrations[cid] = restored["mapping"]
+        result = thermal.calculate(doc, doc.get("logger_rows"),
+                                   calibrations=calibrations,
+                                   only_cases={cid})
+        return jsonify({
+            "ok": True,
+            "reverted_version_id": cur["id"],
+            "restored_version_id": restored["id"] if restored else None,
+            "case_result": result["cases"][cid],
+            "calibrations": _calibration_payload(c, tid),
+        })
+
+    @app.get("/api/trip/<code>/calibration/peaks/<case_id>")
+    def logger_peaks(code, case_id):
+        """记录仪曲线的峰谷候选锚点（局部极值 + 起止点）。"""
+        c = conn()
+        tid = trip_id_or_404(c, code)
+        if tid is None:
+            return jsonify({"error": "trip not found"}), 404
+        doc = storage.load_document(c, tid)
+        rows, _ = _logger_dts(doc, case_id)
+        if not rows:
+            return jsonify({"error": f"{case_id} 没有记录仪数据"}), 400
+        rows = sorted(rows, key=lambda r: r["dt"])
+        peaks = _find_extrema(rows)
+        return jsonify({"case_id": case_id, "extrema": peaks})
+
     # ------------------------------------------------------------ 导入导出
     @app.post("/api/parse-csv")
     def parse_csv():
@@ -326,7 +490,10 @@ def create_app(db_path=None):
         for r in rows:
             by_case.setdefault(r["case_id"], 0)
             by_case[r["case_id"]] += 1
+        # 时区/固定偏移列不再丢弃，供校准工作区预填
+        offsets = calib.extract_offsets(raw)
         return jsonify({"count": len(rows), "by_case": by_case,
+                        "offsets": offsets,
                         "rows": [{"case_id": r["case_id"],
                                   "timestamp": thermal.fmt_dt(r["dt"]),
                                   "temp": r["temp"], "rh": r["rh"]}
@@ -336,14 +503,28 @@ def create_app(db_path=None):
     def sample_logger():
         return Response(sample_data.logger_csv_text(), mimetype="text/csv")
 
+    @app.get("/api/sample/logger-drift.csv")
+    def sample_logger_drift():
+        """带时区/漂移问题的示例记录仪 CSV（校准演示用）。"""
+        return Response(sample_data.drift_logger_csv_text(),
+                        mimetype="text/csv")
+
     @app.post("/api/params")
     def params_json():
         payload = request.get_json(force=True)
         doc = payload.get("document")
         if not isinstance(doc, dict):
             return jsonify({"error": "document 必填"}), 400
-        result = thermal.calculate(doc, doc.get("logger_rows"))
-        bundle = _params_bundle(doc, result)
+        calibrations = payload.get("calibrations") or {}
+        result = thermal.calculate(doc, doc.get("logger_rows"),
+                                   calibrations=calibrations)
+        # 已入库行程以数据库中确认的版本为准进行标注
+        cal_ann = payload.get("calibration_versions")
+        if cal_ann is None:
+            c = conn()
+            tid = trip_id_or_404(c, doc.get("code", ""))
+            cal_ann = _confirmed_calibrations(c, tid) if tid else {}
+        bundle = _params_bundle(doc, result, cal_ann)
         fname = f"params-{doc.get('code', 'trip')}.json"
         return Response(json.dumps(bundle, ensure_ascii=False, indent=2),
                         mimetype="application/json",
@@ -357,18 +538,33 @@ def create_app(db_path=None):
         if tid is None:
             return jsonify({"error": "trip not found"}), 404
         doc = storage.load_document(c, tid)
-        result = thermal.calculate(doc, doc.get("logger_rows"))
-        bundle = _params_bundle(doc, result)
+        confirmed = _confirmed_calibrations(c, tid)
+        result = thermal.calculate(
+            doc, doc.get("logger_rows"),
+            calibrations={cid: v["mapping"]
+                          for cid, v in confirmed.items()})
+        bundle = _params_bundle(doc, result, confirmed)
         return Response(json.dumps(bundle, ensure_ascii=False, indent=2),
                         mimetype="application/json")
 
-    def _params_bundle(doc, result):
+    def _params_bundle(doc, result, calibrations=None):
+        cal_ann = {}
+        for cid, v in (calibrations or {}).items():
+            cal_ann[cid] = {
+                "version_id": v["id"],
+                "note": v["note"],
+                "confirmed_at": v["created_at"],
+                "tz_offset_min": v["mapping"].get("tz_offset_min", 0),
+                "fixed_offset_min": v["mapping"].get("fixed_offset_min", 0),
+                "anchor_count": len(v["mapping"].get("anchors", [])),
+            }
         return {
             "trip": {k: v for k, v in doc.items() if k != "logger_rows"},
             "logger_points": len(doc.get("logger_rows", [])),
             "model": result["constants"],
             "limits_in_effect": {
                 c["id"]: c.get("limits", {}) for c in doc.get("cases", [])},
+            "calibrations": cal_ann,
             "derived": {
                 cid: {
                     "nodes": co["nodes"],
@@ -377,6 +573,7 @@ def create_app(db_path=None):
                     "deviation": co["deviation"],
                     "fitted_tau_multiplier": co["fitted_tau_multiplier"],
                     "risk_count": len(co["risks"]),
+                    "calibration": co.get("calibration"),
                 } for cid, co in result["cases"].items()},
             "risk_text": _risk_text(doc, result),
         }
@@ -387,6 +584,44 @@ def create_app(db_path=None):
 def _node_label(t):
     return {"entry": "进场", "rest": "静置",
             "unpack": "拆外包装", "open": "开箱"}.get(t, t)
+
+
+def _find_extrema(rows, window=6, min_prom=0.8):
+    """在记录仪温度曲线上找峰/谷候选锚点。
+
+    window: 左右各看的采样点数；min_prom: 最小突出度 °C。
+    返回按时间排序的 [{time, temp, kind}]，并始终包含起止点。
+    """
+    out = []
+    n = len(rows)
+    if not n:
+        return out
+    out.append({"time": thermal.fmt_dt(rows[0]["dt"]),
+                "temp": rows[0]["temp"], "kind": "start"})
+    for i in range(window, n - window):
+        seg = rows[i - window:i + window + 1]
+        t_i = rows[i]["temp"]
+        lo = min(r["temp"] for r in seg)
+        hi = max(r["temp"] for r in seg)
+        if t_i == hi and hi - lo >= min_prom:
+            kind = "peak"
+        elif t_i == lo and hi - lo >= min_prom:
+            kind = "valley"
+        else:
+            continue
+        # 相邻同向极值只保留最极端的一个
+        if out and out[-1]["kind"] == kind:
+            prev_t = out[-1]["temp"]
+            if (kind == "peak" and t_i > prev_t) or \
+               (kind == "valley" and t_i < prev_t):
+                out[-1] = {"time": thermal.fmt_dt(rows[i]["dt"]),
+                           "temp": t_i, "kind": kind}
+            continue
+        out.append({"time": thermal.fmt_dt(rows[i]["dt"]),
+                    "temp": t_i, "kind": kind})
+    out.append({"time": thermal.fmt_dt(rows[-1]["dt"]),
+                "temp": rows[-1]["temp"], "kind": "end"})
+    return out
 
 
 def _version_brief(v):
