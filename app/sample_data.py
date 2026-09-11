@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""示例：2026-01-15，三件藏品从 -22°C 严寒室外进入 21°C / 55%RH 暖湿展厅。
+"""示例：2026-01-15，四件藏品从 -22°C 严寒室外进入 21°C / 55%RH 暖湿展厅。
 
 箱 C-01 计划安排合理（隔夜静置后清晨开箱），仅用于对照；
 箱 C-02 实测回温明显偏快（车门漏风/泡沫老化），用于演示"从偏离点建修订"；
-箱 C-03 记录仪中段断档，且拆外包装偏早，用于演示断档与结露风险。
+箱 C-03 记录仪等待窗口内断档，且 19:00 开箱过早，用于演示断档与等待建议；
+箱 C-04 厚保温箱进场仅 1 小时即拆外包装、18:00 过早开箱，演示开箱后结露
+        这一最严重危险及最长等待。
 """
 
 import csv
@@ -43,7 +45,6 @@ def trip_document():
                 "name": "清代绢本设色立轴",
                 "tau_multiplier": 1.0,
                 "k_open": 0.5,
-                "surface_factor": 0.0,
                 "layers": [
                     {"name": "带铝箔木质运输箱", "role": "outer",
                      "r_value": 2.1, "heat_capacity": 1.4,
@@ -67,7 +68,6 @@ def trip_document():
                 "name": "铸铁佛造像（金属，热容大）",
                 "tau_multiplier": 1.0,
                 "k_open": 0.4,
-                "surface_factor": 0.0,
                 "layers": [
                     {"name": "胶合板运输箱", "role": "outer",
                      "r_value": 1.6, "heat_capacity": 2.4,
@@ -91,7 +91,6 @@ def trip_document():
                 "name": "粉彩瓷瓶（对湿度敏感）",
                 "tau_multiplier": 1.0,
                 "k_open": 0.2,
-                "surface_factor": 0.0,
                 "open_r_factor": 1.0,
                 "layers": [
                     {"name": "保温木质运输箱（拆外包装时移除）",
@@ -119,9 +118,7 @@ def trip_document():
                 "name": "绢本小品（厚保温箱，错误早拆）",
                 "tau_multiplier": 1.0,
                 "k_open": 0.3,
-                "surface_factor": 0.0,
                 "open_r_factor": 1.0,
-                "inner_surface_weight": 0.25,
                 "layers": [
                     {"name": "保温木质运输箱", "role": "outer",
                      "r_value": 1.8, "heat_capacity": 1.4,

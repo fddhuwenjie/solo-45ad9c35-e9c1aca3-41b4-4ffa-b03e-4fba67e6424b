@@ -11,9 +11,12 @@
 * 水汽：密封期间箱内绝对湿度 x 不变；开箱后按
       dx/dt = k_open * (x_amb - x)
   若仍有包装层残留，k_open 折减为 1/4（微气候缓冲）。
-* 露点采用 Magnus 公式；露点差 = 冷表面温度 - 露点温度，
-  冷表面温度默认取箱内温度（最保守），可用 surface_factor 让其向环境侧提前。
+* 露点采用 Magnus 公式；结露裕度 = 藏品本体温度（取箱内温度，最保守）
+  − 环境露点。藏品仅在开箱后暴露于暖湿空气，故结露/露点差风险与开箱
+  节点的安全门槛只在开箱后评估；拆外包装时藏品仍密封，不构成暴露。
 * 变化率采用 60 分钟滚动平均（°C/h、%RH/h），避免拆层瞬间的伪尖峰。
+* 安全时刻在候选时刻上重新积分并检验其后 30 分钟连续达标，因此建议
+  时刻是不动点：把节点移到建议时刻重算，等待归零而不会再次顺延。
 """
 
 import math
@@ -143,13 +146,8 @@ def _simulate(case, phases, t_start, t_end,
     tau_mult = float(tau_mult_override if tau_mult_override is not None
                      else case.get("tau_multiplier", 1.0))
     k_open = float(case.get("k_open", 1.5))
-    sf = float(case.get("surface_factor", 0.0))
     # 开盖后残余包装层热阻折减（箱体开盖、藏品暴露使保温下降）
     open_r_factor = float(case.get("open_r_factor", 0.6))
-    # 暴露给暖湿空气的表面温度权重：密封时外箱表面趋近环境（不结露）；
-    # 拆外包装后内包装表面按 inner_surface_weight 介于箱内与环境之间；
-    # 开箱后藏品表面取箱内温度（最保守，weight=0）。
-    inner_surface_weight = float(case.get("inner_surface_weight", 0.55))
 
     M = int((t_end - t_start).total_seconds() // 60)
     m_seed = 0
@@ -178,17 +176,11 @@ def _simulate(case, phases, t_start, t_end,
         tau = max(MIN_TAU_H, C * Rsum * tau_mult)
         k = 0.0 if (not is_open) else (k_open * 0.25 if active else k_open)
 
-        # 当前与暖湿空气接触的"冷表面"温度：
-        # 密封（未拆外包装）：外箱表面趋近环境，用环境温度（不结露）；
-        # 拆外包装后、开箱前：内包装外表面按权重介于箱内与环境之间；
-        # 开箱后：藏品表面取箱内温度（最保守）。
-        t_unpack = nodes.get("unpack")
-        if is_open:
-            t_surface = T
-        elif t_unpack and t >= t_unpack:
-            t_surface = T + inner_surface_weight * (Ta - T)
-        else:
-            t_surface = Ta
+        # 结露判定用冷表面温度：开箱前藏品仍密封于包装内，外表面趋近
+        # 室温、不构成藏品风险；开箱后以藏品本体（箱温，最保守）为准。
+        # 曲线展示统一用箱温作为"冷表面"，具体结露风险见 analyze_case
+        # 中仅对开箱后区间的判定。
+        t_surface = T
 
         minute["T"][m] = T
         minute["x"][m] = x
@@ -409,52 +401,39 @@ def advise_nodes(case, phases, t_start, t_end, limits=None, earliest_from=None):
         scn = calculate_case(c, phases, t_start, t_to, seed=seed)
         return _passes_hold(scn, t_from, checks)
 
-    # ---------- 拆外包装（候选时刻之前外包装始终未拆：全程密封基准） ----------
+    # ---------- 拆外包装（藏品仍密封于内包装，不构成结露暴露，无独立
+    #   安全门槛）。普通模式建议即计划时刻；修订模式从 earliest_from 起排，
+    #   提前拆外包装可加快后续回温，开箱建议随之联动。 ----------
     t_up_plan = nodes.get("unpack")
     if t_up_plan:
-        sealed = copy.deepcopy(case)
-        sealed["nodes"] = [n for n in sealed.get("nodes", [])
-                           if n["type"] not in ("unpack", "open")]
-        base = _simulate(sealed, phases, t_start, t_end)
-
-        def unpack_ok(tc):
-            c = copy.deepcopy(case)
-            for n in c.get("nodes", []):
-                if n["type"] == "unpack":
-                    n["time"] = fmt_dt(tc)
-                if n["type"] == "open" and parse_dt(n["time"]) <= tc:
-                    # 候选拆外包装时箱盖仍关闭：把早于该时刻的开箱节点挪后
-                    n["time"] = fmt_dt(tc + step)
-            Tv, xv = state_at(base, tc)
-            sd = (tc, Tv, xv)
-            # 拆外包装时藏品仍由内包装保护：门槛只有冷表面露点差；
-            # 升温率在风险曲线全程显示，但不作为该节点的阻断条件。
-            return scenario_ok(c, sd, tc, [dew_ok])
-
-        tc = floor_step(max(t_up_plan, earliest_from.get("unpack", t_up_plan)))
-        a_unpack = None
-        while tc <= t_end:
-            if unpack_ok(tc):
-                a_unpack = {"planned": fmt_dt(t_up_plan),
-                            "safe_time": fmt_dt(tc),
-                            "wait_minutes": int(
-                                (tc - t_up_plan).total_seconds() / 60)}
-                break
-            tc += step
-        if a_unpack is None:
-            a_unpack = {"planned": fmt_dt(t_up_plan), "safe_time": None,
-                        "wait_minutes": None}
-        advice["unpack"] = a_unpack
+        if earliest_from:
+            t_up_eff = floor_step(
+                earliest_from.get("unpack", t_up_plan))
+        else:
+            t_up_eff = t_up_plan
+        advice["unpack"] = {
+            "planned": fmt_dt(t_up_plan),
+            "safe_time": fmt_dt(min(t_up_eff, t_end)),
+            "wait_minutes": int(
+                (min(t_up_eff, t_end) - t_up_plan).total_seconds() / 60)}
+        a_unpack = advice["unpack"]
     else:
         a_unpack = None
 
-    # ---------- 开箱（基准为*当前文档*的拆外包装安排，保证只拖开箱
-    #              节点时建议自洽；建议的完整排程仍按顺序先定拆外包装） ----------
+    # ---------- 开箱（普通模式基准为当前文档的拆外包装安排，保证只拖开箱
+    #   节点时建议自洽；修订模式基准采用重算出的拆外包装安全时刻） ----------
     t_open_plan = nodes.get("open")
     if t_open_plan:
-        t_unpack = nodes.get("unpack")
-        # 基准：外包装按当前安排拆除、箱盖仍密封
+        if earliest_from and a_unpack and a_unpack.get("safe_time"):
+            t_unpack = parse_dt(a_unpack["safe_time"])
+        else:
+            t_unpack = nodes.get("unpack")
+        # 基准：外包装按上述安排拆除、箱盖仍密封
         pre = copy.deepcopy(case)
+        if t_unpack:
+            for n in pre.get("nodes", []):
+                if n["type"] == "unpack":
+                    n["time"] = fmt_dt(t_unpack)
         base_open = _simulate(pre, phases, t_start, t_end)
         seed_t = t_unpack or t_open_plan
 
@@ -467,7 +446,13 @@ def advise_nodes(case, phases, t_start, t_end, limits=None, earliest_from=None):
             sd = (seed_t, To, xo)
             return scenario_ok(c, sd, tc, [dew_ok, warm_ok, rh_ok])
 
-        tc = max(t_open_plan, t_unpack or t_open_plan)
+        # 普通模式候选不早于原计划；修订模式从拆外包装安全时刻起向前重排
+        if earliest_from:
+            start_open = earliest_from.get("open", t_unpack or t_open_plan)
+            tc0 = start_open
+        else:
+            tc0 = max(t_open_plan, t_unpack or t_open_plan)
+        tc = floor_step(tc0)
         a_open = None
         while tc <= t_end:
             if open_ok(tc):
@@ -499,14 +484,18 @@ def analyze_case(case, series, gaps, phases=None, t_start=None, t_end=None):
             return True
         return parse_dt(p["time"]) >= _t
 
-    # 结露 / 露点差不足（仅在藏品进场之后评估：室外装卸无结露防护意义）
+    # 结露 / 露点差不足：藏品仅在开箱后才暴露于暖湿空气，故只在
+    # "进场之后且已开箱"的区间评估；未开箱时冷表面不接触展厅空气。
+    def exposed(p):
+        return after_entry(p) and not p["sealed"]
+
     for hard, flag, kind, sev, msg in (
-        (True, lambda p: after_entry(p) and p["margin"] < 0,
+        (True, lambda p: exposed(p) and p["margin"] < 0,
          "condensation", "danger",
-         "冷表面温度已低于环境露点，存在结露"),
-        (False, lambda p: after_entry(p) and 0 <= p["margin"] < dew_lim,
+         "藏品表面温度已低于环境露点，存在结露"),
+        (False, lambda p: exposed(p) and 0 <= p["margin"] < dew_lim,
          "dewpoint_margin", "warn",
-         f"露点差不足 {dew_lim:g}°C，临近结露"),
+         f"开箱后露点差不足 {dew_lim:g}°C，临近结露"),
     ):
         for a, b in _episodes(flag, series):
             peak = min(series[k]["margin"] for k in range(a, b + 1))

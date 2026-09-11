@@ -210,7 +210,7 @@ var Editor = (function () {
     add.addEventListener("click", function () {
       d.cases.push({ id: "C-" + (d.cases.length + 1).toString().padStart(2, "0"),
         name: "新箱", tau_multiplier: 1, k_open: 1.5,
-        surface_factor: 0, layers: [],
+        open_r_factor: 1.0, layers: [],
         limits: { dew_margin: 2, warm_rate: 2, rh_rate: 5,
           min_rest_min: 240 },
         nodes: [

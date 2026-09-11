@@ -255,8 +255,24 @@ def create_app(db_path=None):
         if fitted:
             case["tau_multiplier"] = fitted
 
-        # 4) 以新模型重算待执行节点的安全时刻，生成并写入新安排
-        advice = thermal.advise_nodes(case, phases, t_start, t_end)
+        # 4) 以新模型*从偏离点*重算待执行节点的安全时刻，生成并写入新安排
+        limits = case.get("limits", {})
+        min_rest = float(limits.get("min_rest_min", 240))
+        nodes = {n["type"]: thermal.parse_dt(n["time"])
+                 for n in case.get("nodes", [])}
+        t_rest_ref = nodes.get("rest", nodes.get("entry", t_dev))
+        # 拆外包装不得早于 偏离点 与 静置起+最短静置 两者较晚者
+        floor_unpack = max(t_dev, t_rest_ref
+                           + timedelta(minutes=min_rest))
+        earliest_from = {"unpack": floor_unpack}
+        advice = thermal.advise_nodes(
+            case, phases, t_start, t_end,
+            earliest_from=earliest_from)
+        # 开箱不得早于重算出的拆外包装安全时刻（advise_nodes 已据此联动）
+        a_up = advice.get("unpack") or {}
+        if a_up.get("safe_time"):
+            earliest_from["open"] = thermal.parse_dt(a_up["safe_time"])
+
         new_schedule = {}
         for ntype in ("unpack", "open"):
             adv = advice.get(ntype)
@@ -264,12 +280,12 @@ def create_app(db_path=None):
                          if n["type"] == ntype), None)
             if (node and adv and adv.get("safe_time")
                     and thermal.parse_dt(node["time"]) > t_dev
-                    and not node.get("locked")
-                    and node["time"] != adv["safe_time"]):
+                    and not node.get("locked")):
                 old_time = node["time"]
                 node["time"] = adv["safe_time"]
-                new_schedule[ntype] = {"from": old_time,
-                                       "to": adv["safe_time"]}
+                if old_time != adv["safe_time"]:
+                    new_schedule[ntype] = {"from": old_time,
+                                           "to": adv["safe_time"]}
 
         labels = {"unpack": "拆外包装", "open": "开箱"}
         sched_txt = "，".join(
