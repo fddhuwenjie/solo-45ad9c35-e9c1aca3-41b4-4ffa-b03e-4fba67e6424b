@@ -147,7 +147,8 @@ def delete_calibrations(conn, trip_id):
     conn.commit()
 
 
-def revert_calibration(conn, trip_id, case_id):    """撤销当前生效映射：置为 reverted，并把上一版恢复为 confirmed。
+def revert_calibration(conn, trip_id, case_id):
+    """撤销当前生效映射：置为 reverted，并把上一版恢复为 confirmed。
 
     返回 (被撤销的版本, 恢复的版本或 None)。
     """

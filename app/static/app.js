@@ -279,7 +279,7 @@
       html += "<tr><td><b>" + esc(c.id) + "</b><br>" +
         '<span class="muted small">' + esc(c.name) + "</span>" +
         (cal ? '<br><span class="tag info" title="' +
-          esc(cal.note || "") + "">校准 v" + cal.version_id + "</span>"
+          esc(cal.note || "") + '">校准 v' + cal.version_id + "</span>"
           : "") + "</td>";
       html += "<td>" + short(nodes.entry) + "</td>";
       html += "<td>" + short(nodes.rest) + "</td>";
