@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>现场操作单 {{ doc.code }}</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .risk-line { margin: 4px 0; padding: 5px 9px; border-radius: 5px; }
+  .risk-line.danger { background: #fbeae7; color: #7c2318; }
+  .risk-line.warn { background: #fdf3e1; color: #6e4a12; }
+</style>
+</head>
+<body>
+<div class="sheet-wrap">
+  <div class="no-print" style="text-align:right;margin-bottom:10px">
+    <button class="btn btn-primary" onclick="window.print()">打印 / 存 PDF</button>
+  </div>
+
+  <div class="sheet-head">
+    <h1>藏品转运回温 · 现场操作单</h1>
+    <div class="sheet-meta">
+      行程编号：<b>{{ doc.code }}</b>　{{ doc.title }}<br>
+      打印时间：{{ result.domain.start }} ～ {{ result.domain.end }}
+      （计算时间带）
+    </div>
+  </div>
+
+  <section class="sheet-section">
+    <h2>一、逐箱开箱时刻表</h2>
+    <table class="grid">
+      <tr>
+        <th>箱号 / 藏品</th><th>进场</th><th>静置开始</th>
+        <th>静置时长</th><th>拆外包装</th><th>判定</th>
+        <th>开箱</th><th>判定</th>
+      </tr>
+      {% for r in rows %}
+      <tr>
+        <td><b>{{ r.id }}</b><br><span class="muted small">{{ r.name }}</span></td>
+        <td>{{ r.entry.replace('T',' ') }}</td>
+        <td>{{ r.rest.replace('T',' ') }}</td>
+        <td>
+          {% if r.rest_info %}
+            {{ '%.1f'|format(r.rest_info.minutes/60) }}h /
+            要求 {{ '%.1f'|format(r.rest_info.required/60) }}h
+            {% if r.rest_info.enough %}<span class="tag ok">够</span>
+            {% else %}<span class="tag warn">不足</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>{{ r.unpack.replace('T',' ') }}</td>
+        <td>{{ r.unpack_note }}</td>
+        <td>{{ r.open.replace('T',' ') }}</td>
+        <td>{{ r.open_note }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p class="muted small" style="margin-top:6px">
+      “需等待 N 分”表示按建议安全时刻执行：露点差、升温率、相对湿度变化率
+      全部连续 30 分钟达标后方可操作；标“已执行”者取自封存事件。
+    </p>
+  </section>
+
+  <section class="sheet-section">
+    <h2>二、现场操作要点</h2>
+    <ol>
+      <li>藏品自冷藏车进入暖湿展厅后<b>不得立即开箱</b>：冷表面遇到
+        {{ doc.phases[-1].temp }}°C / {{ doc.phases[-1].rh }}%RH 的展厅空气，
+        露点约 {{ result.ambient[-1].td_amb }}°C，低于露点即结露。</li>
+      <li>全程保持运输箱密封静置，按上表“建议安全时刻”拆外包装与开箱；
+        如需提前操作，必须先在系统中拖移节点并重算确认。</li>
+      <li>拆外包装后保留内衬继续缓冲；开箱前核对箱内温湿度记录仪读数。</li>
+      <li>出现结露征兆（表面雾状水膜、水珠）立即停止操作、恢复密封并上报。</li>
+      <li>记录仪断档时段无法证明回温过程，须人工核查并在风险说明中记录。</li>
+    </ol>
+  </section>
+
+  <section class="sheet-section">
+    <h2>三、风险说明</h2>
+    {% set ns = namespace(any=false) %}
+    {% for r in rows %}
+      {% for risk in r.risks %}
+        {% set ns.any = true %}
+        <div class="risk-line {{ 'danger' if risk.kind == 'condensation' else 'warn' }}">
+          [{{ r.id }} · {{ r.name }}]
+          {{ risk.start.replace('T',' ') }}
+          {% if risk.end != risk.start %}– {{ risk.end.replace('T',' ') }}{% endif %}
+          —— {{ risk.message }}
+          ({{ '危险' if risk.severity == 'danger' else '预警' }})
+        </div>
+      {% endfor %}
+    {% endfor %}
+    {% if not ns.any %}
+      <p class="tag ok">本版安排未检出结露、升温/湿度过快、断档或静置不足。</p>
+    {% endif %}
+  </section>
+
+  <section class="sheet-section">
+    <h2>四、环境与模型参数（摘要）</h2>
+    <table class="grid">
+      <tr><th>阶段</th><th>开始</th><th>结束</th><th>温度 °C</th><th>RH %</th></tr>
+      {% for p in doc.phases %}
+      <tr><td>{{ p.name }}</td>
+        <td>{{ p.start.replace('T',' ') }}</td>
+        <td>{{ p.end.replace('T',' ') }}</td>
+        <td>{{ p.temp }}</td><td>{{ p.rh }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="muted small" style="margin-top:6px">
+      模型：集总热容一阶热响应 τ=C·ΣR×系数（{{ doc.cases|length }} 箱各自拟合）；
+      露点按 Magnus 公式；变化率为 60 分钟滚动平均；完整参数见导出的
+      params-{{ doc.code }}.json。
+    </p>
+  </section>
+
+  <div class="sign">
+    <span>布展负责人签字</span>
+    <span>藏品保管签字</span>
+    <span>日期</span>
+  </div>
+</div>
+</body>
+</html>

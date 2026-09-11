@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>藏品转运回温编排</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">❄→▦</span>
+    <div>
+      <h1>藏品转运回温编排</h1>
+      <p class="sub">冬季借展 · 冷表面结露防护 · 逐箱回温排程</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="trip-code" class="trip-code">未载入</span>
+    <button id="btn-sample" class="btn">载入示例行程</button>
+    <label class="btn btn-ghost">
+      导入记录仪 CSV
+      <input id="csv-file" type="file" accept=".csv" hidden>
+    </label>
+    <button id="btn-calc" class="btn btn-primary" disabled>重算</button>
+    <button id="btn-save" class="btn" disabled>封存版本</button>
+    <a id="link-sheet" class="btn btn-ghost" target="_blank" hidden>操作单</a>
+    <button id="btn-params" class="btn btn-ghost" disabled>参数 JSON</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左：风险面板 + 路线时间带 -->
+  <section class="col col-chart">
+    <div id="risk-banner" class="risk-banner muted">
+      载入行程后将在此显示最早风险位置与等待时间。
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>路线时间带与回温曲线</h2>
+        <div class="legend" id="chart-legend"></div>
+      </div>
+      <div id="charts" class="charts">
+        <div class="empty-hint">尚未计算：请先载入示例行程或编辑后点击“重算”。</div>
+      </div>
+      <div class="chart-help">
+        提示：拖动底部各箱的 <b>进场 / 静置 / 拆外包装 / 开箱</b> 节点可调整安排；
+        已封存事件显示为挂锁，不可拖移。
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>逐箱开箱时刻表</h2>
+        <div class="muted small">建议安全时刻 = 露点差、升温率、湿度变化率全部连续达标 30 分钟</div>
+      </div>
+      <div id="open-table"></div>
+    </div>
+  </section>
+
+  <!-- 右：编辑 / 版本 / 风险 -->
+  <aside class="col col-side">
+    <div class="card">
+      <div class="card-head"><h2>风险说明</h2></div>
+      <div id="risk-list" class="risk-list muted">暂无</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>行程与参数编辑</h2>
+        <div class="tabs">
+          <button class="tab active" data-tab="phases">阶段</button>
+          <button class="tab" data-tab="cases">箱体/限值</button>
+          <button class="tab" data-tab="logger">记录仪</button>
+          <button class="tab" data-tab="json">JSON</button>
+        </div>
+      </div>
+      <div id="editor"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>版本 / 修订</h2>
+        <button id="btn-revision" class="btn btn-warn" disabled>从偏离点建修订</button>
+      </div>
+      <ol id="version-list" class="version-list muted"><li>尚无封存版本</li></ol>
+    </div>
+  </aside>
+</main>
+
+<div id="tooltip" class="tooltip" hidden></div>
+<div id="modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="btn btn-ghost">关闭</button>
+    </div>
+    <pre id="modal-body" class="modal-body"></pre>
+  </div>
+</div>
+
+<script>
+window.SAMPLE_CODE = {{ sample_code|tojson }};
+</script>
+<script src="/static/charts.js"></script>
+<script src="/static/editor.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
