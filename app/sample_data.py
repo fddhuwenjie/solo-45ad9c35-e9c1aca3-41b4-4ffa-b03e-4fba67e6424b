@@ -90,23 +90,53 @@ def trip_document():
                 "id": "C-03",
                 "name": "粉彩瓷瓶（对湿度敏感）",
                 "tau_multiplier": 1.0,
-                "k_open": 1.5,
+                "k_open": 0.2,
                 "surface_factor": 0.0,
+                "open_r_factor": 1.0,
                 "layers": [
-                    {"name": "铝制航空箱", "role": "outer",
-                     "r_value": 0.8, "heat_capacity": 1.0,
+                    {"name": "保温木质运输箱（拆外包装时移除）",
+                     "role": "outer",
+                     "r_value": 2.0, "heat_capacity": 1.3,
                      "removed_at": "unpack"},
-                    {"name": "气泡膜+无酸纸", "role": "inner",
-                     "r_value": 0.25, "heat_capacity": 0.3,
-                     "removed_at": "open"},
+                    {"name": "薄 PE 棉缓冲内包（开盖后仍留箱底）",
+                     "role": "inner",
+                     "r_value": 0.8, "heat_capacity": 0.8,
+                     "removed_at": "none"},
                 ],
                 "limits": {"dew_margin": 2.0, "warm_rate": 2.0,
                            "rh_rate": 5.0, "min_rest_min": 240},
                 "nodes": [
                     {"type": "entry", "time": f"{D}T12:50"},
                     {"type": "rest", "time": f"{D}T13:00"},
-                    {"type": "unpack", "time": f"{D}T14:30"},
+                    {"type": "unpack", "time": f"{D}T18:00"},
                     {"type": "open", "time": f"{D}T19:00"},
+                ],
+            },
+            {
+                # 反面案例：厚保温箱进场仅 1 小时即拆外包装，冷内表面
+                # 长时间低于展厅露点 -> 结露；演示最早危险与大幅等待。
+                "id": "C-04",
+                "name": "绢本小品（厚保温箱，错误早拆）",
+                "tau_multiplier": 1.0,
+                "k_open": 0.3,
+                "surface_factor": 0.0,
+                "open_r_factor": 1.0,
+                "inner_surface_weight": 0.25,
+                "layers": [
+                    {"name": "保温木质运输箱", "role": "outer",
+                     "r_value": 1.8, "heat_capacity": 1.4,
+                     "removed_at": "unpack"},
+                    {"name": "厚泡沫内包（拆箱后保留）", "role": "inner",
+                     "r_value": 2.5, "heat_capacity": 1.0,
+                     "removed_at": "none"},
+                ],
+                "limits": {"dew_margin": 2.0, "warm_rate": 2.0,
+                           "rh_rate": 5.0, "min_rest_min": 240},
+                "nodes": [
+                    {"type": "entry", "time": f"{D}T12:55"},
+                    {"type": "rest", "time": f"{D}T13:00"},
+                    {"type": "unpack", "time": f"{D}T14:00"},
+                    {"type": "open", "time": f"{D}T18:00"},
                 ],
             },
         ],
@@ -122,9 +152,11 @@ def _case_measured(case_id):
         "C-01": {"tau_mult": 1.00, "noise": 0.25, "gap": None},
         # 车门密封条老化、泡沫受潮 -> 实际热阻约为模型的 65%，回温偏快
         "C-02": {"tau_mult": 0.62, "noise": 0.3, "gap": None},
-        # 记录仪在 14:10–15:20 断电断档
+        # 记录仪在等待开箱窗口内 19:30–20:45 断电断档
         "C-03": {"tau_mult": 0.9, "noise": 0.3,
-                 "gap": (f"{D}T14:10", f"{D}T15:20")},
+                 "gap": (f"{D}T19:30", f"{D}T20:45")},
+        # 反面案例：记录与模型一致（无偏离），呈现真实结露过程
+        "C-04": {"tau_mult": 1.0, "noise": 0.25, "gap": None},
     }[case_id]
 
 

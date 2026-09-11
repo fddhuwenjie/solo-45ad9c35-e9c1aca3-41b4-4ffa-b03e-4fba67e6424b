@@ -25,6 +25,7 @@ OUT_STEP_MIN = 5          # 输出曲线采样间隔
 RATE_WINDOW_MIN = 60      # 变化率滚动窗口
 MIN_TAU_H = 0.25          # 全部包装拆除后的最小热时间常数
 HOLD_MIN = 30             # 判定"安全"所需的连续达标时长
+ADVICE_STEP_MIN = 15      # 安全时刻候选步进
 DEFAULT_GAP_MIN = 30      # 记录仪断档阈值
 DEFAULT_DEV_T = 2.0       # 实测偏离阈值 °C
 
@@ -121,15 +122,19 @@ def _active_layers(case, is_open, t, nodes):
             removed_at = "open" if ly.get("role") == "inner" else "unpack"
         if removed_at == "unpack" and t_unpack and t >= t_unpack:
             continue
-        if removed_at == "open" and is_open and t_open and t >= t_open:
+        if removed_at == "open" and is_open and t_open and t > t_open:
             continue
         layers.append(ly)
     return layers
 
 
 def _simulate(case, phases, t_start, t_end,
-              tau_mult_override=None, ambient_override=None):
-    """逐分钟积分，返回分钟网格上的状态字典。"""
+              tau_mult_override=None, ambient_override=None, seed=None):
+    """逐分钟积分，返回分钟网格上的状态字典。
+
+    seed=(t_seed, T, x)：候选时刻之前的演化与基准一致时，从 t_seed 的
+    给定温度/绝对湿度接续积分，避免每次候选都从头重算。
+    """
     amb = ambient_override or (lambda t: ambient_at(phases, t))
     nodes = _node_map(case)
     t_open = nodes.get("open")
@@ -139,32 +144,58 @@ def _simulate(case, phases, t_start, t_end,
                      else case.get("tau_multiplier", 1.0))
     k_open = float(case.get("k_open", 1.5))
     sf = float(case.get("surface_factor", 0.0))
+    # 开盖后残余包装层热阻折减（箱体开盖、藏品暴露使保温下降）
+    open_r_factor = float(case.get("open_r_factor", 0.6))
+    # 暴露给暖湿空气的表面温度权重：密封时外箱表面趋近环境（不结露）；
+    # 拆外包装后内包装表面按 inner_surface_weight 介于箱内与环境之间；
+    # 开箱后藏品表面取箱内温度（最保守，weight=0）。
+    inner_surface_weight = float(case.get("inner_surface_weight", 0.55))
 
     M = int((t_end - t_start).total_seconds() // 60)
-    T0, RH0 = amb(t_start)
-    T = float(T0)
-    x = x_from_rh(T0, RH0)
+    m_seed = 0
+    if seed is not None:
+        t_seed, T, x = seed
+        m_seed = int((t_seed - t_start).total_seconds() // 60)
+    else:
+        T0, RH0 = amb(t_start)
+        T, x = float(T0), x_from_rh(T0, RH0)
 
     minute = {
-        "T": [0.0] * (M + 1), "x": [0.0] * (M + 1),
-        "Ta": [0.0] * (M + 1), "RHa": [0.0] * (M + 1),
+        "T": [None] * (M + 1), "x": [None] * (M + 1),
+        "Ta": [None] * (M + 1), "RHa": [None] * (M + 1),
         "sealed": [True] * (M + 1), "t_start": t_start,
+        "Tsurf": [None] * (M + 1),
     }
 
-    for m in range(M + 1):
+    for m in range(m_seed, M + 1):
         t = t_start + timedelta(minutes=m)
         Ta, RHa = amb(t)
-        is_open = bool(t_open and t >= t_open)
+        # 开箱当刻箱盖仍处于关闭状态，t > t_open 才视为已开启
+        is_open = bool(t_open and t > t_open)
         active = _active_layers(case, is_open, t, nodes)
-        Rsum = sum(float(ly.get("r_value", 0.0)) for ly in active)
+        r_factor = open_r_factor if is_open else 1.0
+        Rsum = sum(float(ly.get("r_value", 0.0)) for ly in active) * r_factor
         tau = max(MIN_TAU_H, C * Rsum * tau_mult)
         k = 0.0 if (not is_open) else (k_open * 0.25 if active else k_open)
+
+        # 当前与暖湿空气接触的"冷表面"温度：
+        # 密封（未拆外包装）：外箱表面趋近环境，用环境温度（不结露）；
+        # 拆外包装后、开箱前：内包装外表面按权重介于箱内与环境之间；
+        # 开箱后：藏品表面取箱内温度（最保守）。
+        t_unpack = nodes.get("unpack")
+        if is_open:
+            t_surface = T
+        elif t_unpack and t >= t_unpack:
+            t_surface = T + inner_surface_weight * (Ta - T)
+        else:
+            t_surface = Ta
 
         minute["T"][m] = T
         minute["x"][m] = x
         minute["Ta"][m] = Ta
         minute["RHa"][m] = RHa
         minute["sealed"][m] = not is_open
+        minute["Tsurf"][m] = t_surface
 
         if m < M:
             dt_h = 1.0 / 60.0
@@ -172,36 +203,45 @@ def _simulate(case, phases, t_start, t_end,
             if k > 0:
                 xa = x_from_rh(Ta, RHa)
                 x += k * (xa - x) * dt_h
+    # 种子段以前保持 None：不得回填，否则污染 60 分钟滚动变化率
     return minute
 
 
 def calculate_case(case, phases, t_start, t_end,
-                   tau_mult_override=None, ambient_override=None):
+                   tau_mult_override=None, ambient_override=None, seed=None):
     """逐分钟积分，返回网格序列（每 OUT_STEP_MIN 分钟一点）。"""
     minute = _simulate(case, phases, t_start, t_end,
-                       tau_mult_override, ambient_override)
+                       tau_mult_override, ambient_override, seed)
     M = len(minute["T"]) - 1
     t_start = minute["t_start"]
-    sf = float(case.get("surface_factor", 0.0))
 
     def rate(arr, m):
+        # 种子接续时更早的网格为 None：只用真实积分段，回到最早可用点
         j = max(0, m - RATE_WINDOW_MIN)
+        while j < m and arr[j] is None:
+            j += 1
         h = (m - j) / 60.0
-        if h <= 0:
+        if h <= 0 or arr[j] is None:
             return 0.0
         return (arr[m] - arr[j]) / h
 
     series = []
     for m in range(0, M + 1, OUT_STEP_MIN):
+        if minute["T"][m] is None:
+            continue  # 种子接续点以前无真实状态
         t = t_start + timedelta(minutes=m)
         Ta, RHa = minute["Ta"][m], minute["RHa"][m]
         Tin = minute["T"][m]
         RHi = rh_from_x(minute["x"][m], Tin)
         Td_amb = dewpoint(Ta, RHa)
         Td_in = dewpoint(Tin, RHi)
-        Tsurf = Tin + sf * (Ta - Tin)
+        Tsurf = minute["Tsurf"][m]
         sealed = minute["sealed"][m]
-        margin = Tsurf - (Td_in if not sealed else Td_amb)
+        # 结露裕度：暴露表面温度对环境露点；开箱后箱内空气湿化时，
+        # 藏品表面对箱内露点更保守，取两者较小值。
+        margin_amb = Tsurf - Td_amb
+        margin_in = Tin - Td_in
+        margin = min(margin_amb, margin_in) if not sealed else margin_amb
         series.append({
             "time": fmt_dt(t),
             "t_amb": round(Ta, 2),
@@ -221,8 +261,10 @@ def calculate_case(case, phases, t_start, t_end,
 
 def _rh_rate(minute, m):
     j = max(0, m - RATE_WINDOW_MIN)
+    while j < m and minute["x"][j] is None:
+        j += 1
     h = (m - j) / 60.0
-    if h <= 0:
+    if h <= 0 or minute["x"][j] is None:
         return 0.0
     rh_now = rh_from_x(minute["x"][m], minute["T"][m])
     rh_then = rh_from_x(minute["x"][j], minute["T"][j])
@@ -301,7 +343,147 @@ def _first_safe_after(series, idx0, checks, hold_min=HOLD_MIN):
     return None
 
 
-def analyze_case(case, series, gaps):
+def _clone_case_at(case, overrides):
+    """深拷贝箱体并按 {node_type: datetime} 覆盖节点时刻。"""
+    import copy
+    c = copy.deepcopy(case)
+    for n in c.get("nodes", []):
+        if n["type"] in overrides:
+            n["time"] = fmt_dt(overrides[n["type"]])
+    return c
+
+
+def _passes_hold(scn_series, t_from, checks, hold_min=HOLD_MIN):
+    """从 t_from 起连续 hold_min（含）全部达标；序列末尾不足时长时判不通过。"""
+    hold_pts = hold_min // OUT_STEP_MIN
+    seg = [p for p in scn_series if parse_dt(p["time"]) >= t_from]
+    if len(seg) < hold_pts:
+        return False
+    return all(all(c(p) for c in checks) for p in seg[:hold_pts])
+
+
+def advise_nodes(case, phases, t_start, t_end, limits=None, earliest_from=None):
+    """逐候选时刻重模拟，求各操作节点的最早安全时刻（不动点）。
+
+    关键：检验某个候选时刻是否安全，必须把节点*放到该时刻*重新积分，
+    再检查该次操作之后连续 HOLD_MIN 是否达标——这样把建议时刻回填为
+    计划时刻重算时，结论保持成立、等待归零，不会被自身引发的瞬态再次顺延。
+
+    earliest_from={node_type: datetime}：候选搜索起点（默认取计划时刻）。
+    修订时从偏离点（含最短静置约束）起向前重排，可把操作提前。
+
+    加速：候选时刻之前的演化与基准完全一致，用一次基准模拟在拆外包装
+    时刻取得箱温/绝对湿度作为"种子"，每个候选只需积分候选点之后
+    HOLD_MIN + 余量的短窗口。
+    """
+    import copy
+    limits = limits or case.get("limits", {})
+    dew_lim = float(limits.get("dew_margin", 2.0))
+    warm_lim = float(limits.get("warm_rate", 2.0))
+    rh_lim = float(limits.get("rh_rate", 5.0))
+    min_rest = float(limits.get("min_rest_min", 240))
+    dew_ok = lambda p: p["margin"] >= dew_lim
+    warm_ok = lambda p: p["warm_rate"] <= warm_lim
+    rh_ok = lambda p: abs(p["rh_rate"]) <= rh_lim
+
+    nodes = _node_map(case)
+    advice = {}
+    step = timedelta(minutes=ADVICE_STEP_MIN)
+    # 滚动变化率回看 60 分钟，故候选窗口需覆盖 HOLD + RATE_WINDOW
+    win_min = 180  # 候选操作后 3 小时窗口足以覆盖回温/湿度瞬态
+    earliest_from = earliest_from or {}
+
+    def floor_step(t):
+        # 对齐到 ADVICE_STEP_MIN
+        m = int((t - t_start).total_seconds() // 60)
+        m = ((m + ADVICE_STEP_MIN - 1) // ADVICE_STEP_MIN) * ADVICE_STEP_MIN
+        return t_start + timedelta(minutes=m)
+
+    def state_at(base_minute, t_at):
+        k = int((t_at - t_start).total_seconds() // 60)
+        k = max(0, min(len(base_minute["T"]) - 1, k))
+        return base_minute["T"][k], base_minute["x"][k]
+
+    def scenario_ok(c, seed, t_from, checks):
+        t_to = min(t_end, t_from + timedelta(minutes=win_min))
+        scn = calculate_case(c, phases, t_start, t_to, seed=seed)
+        return _passes_hold(scn, t_from, checks)
+
+    # ---------- 拆外包装（候选时刻之前外包装始终未拆：全程密封基准） ----------
+    t_up_plan = nodes.get("unpack")
+    if t_up_plan:
+        sealed = copy.deepcopy(case)
+        sealed["nodes"] = [n for n in sealed.get("nodes", [])
+                           if n["type"] not in ("unpack", "open")]
+        base = _simulate(sealed, phases, t_start, t_end)
+
+        def unpack_ok(tc):
+            c = copy.deepcopy(case)
+            for n in c.get("nodes", []):
+                if n["type"] == "unpack":
+                    n["time"] = fmt_dt(tc)
+                if n["type"] == "open" and parse_dt(n["time"]) <= tc:
+                    # 候选拆外包装时箱盖仍关闭：把早于该时刻的开箱节点挪后
+                    n["time"] = fmt_dt(tc + step)
+            Tv, xv = state_at(base, tc)
+            sd = (tc, Tv, xv)
+            # 拆外包装时藏品仍由内包装保护：门槛只有冷表面露点差；
+            # 升温率在风险曲线全程显示，但不作为该节点的阻断条件。
+            return scenario_ok(c, sd, tc, [dew_ok])
+
+        tc = floor_step(max(t_up_plan, earliest_from.get("unpack", t_up_plan)))
+        a_unpack = None
+        while tc <= t_end:
+            if unpack_ok(tc):
+                a_unpack = {"planned": fmt_dt(t_up_plan),
+                            "safe_time": fmt_dt(tc),
+                            "wait_minutes": int(
+                                (tc - t_up_plan).total_seconds() / 60)}
+                break
+            tc += step
+        if a_unpack is None:
+            a_unpack = {"planned": fmt_dt(t_up_plan), "safe_time": None,
+                        "wait_minutes": None}
+        advice["unpack"] = a_unpack
+    else:
+        a_unpack = None
+
+    # ---------- 开箱（基准为*当前文档*的拆外包装安排，保证只拖开箱
+    #              节点时建议自洽；建议的完整排程仍按顺序先定拆外包装） ----------
+    t_open_plan = nodes.get("open")
+    if t_open_plan:
+        t_unpack = nodes.get("unpack")
+        # 基准：外包装按当前安排拆除、箱盖仍密封
+        pre = copy.deepcopy(case)
+        base_open = _simulate(pre, phases, t_start, t_end)
+        seed_t = t_unpack or t_open_plan
+
+        def open_ok(tc):
+            c = copy.deepcopy(pre)
+            for n in c.get("nodes", []):
+                if n["type"] == "open":
+                    n["time"] = fmt_dt(tc)
+            To, xo = state_at(base_open, seed_t)
+            sd = (seed_t, To, xo)
+            return scenario_ok(c, sd, tc, [dew_ok, warm_ok, rh_ok])
+
+        tc = max(t_open_plan, t_unpack or t_open_plan)
+        a_open = None
+        while tc <= t_end:
+            if open_ok(tc):
+                a_open = {"planned": fmt_dt(t_open_plan),
+                          "safe_time": fmt_dt(tc),
+                          "wait_minutes": int(
+                              (tc - t_open_plan).total_seconds() / 60)}
+                break
+            tc += step
+        if a_open is None:
+            a_open = {"planned": fmt_dt(t_open_plan), "safe_time": None,
+                      "wait_minutes": None}
+        advice["open"] = a_open
+    return advice
+
+def analyze_case(case, series, gaps, phases=None, t_start=None, t_end=None):
     limits = case.get("limits", {})
     dew_lim = float(limits.get("dew_margin", 2.0))
     warm_lim = float(limits.get("warm_rate", 2.0))
@@ -358,36 +540,39 @@ def analyze_case(case, series, gaps):
                       "peak": g["minutes"],
                       "message": f"记录仪断档 {g['minutes']} 分钟"})
 
-    # ---- 节点安全时刻：从节点向后找连续达标的最早时刻
-    node_advice = {}
-    idx_of = {p["time"]: i for i, p in enumerate(series)}
+    # ---- 节点安全时刻：候选时刻重模拟（不动点建议）
+    if phases is not None and t_start is not None and t_end is not None:
+        node_advice = advise_nodes(case, phases, t_start, t_end, limits)
+    else:
+        node_advice = {}
+        idx_of = {p["time"]: i for i, p in enumerate(series)}
 
-    def nearest_idx(t):
-        target = (t - parse_dt(series[0]["time"])).total_seconds() / 60
-        return max(0, min(len(series) - 1,
-                          int(round(target / OUT_STEP_MIN))))
+        def nearest_idx(t):
+            target = (t - parse_dt(series[0]["time"])).total_seconds() / 60
+            return max(0, min(len(series) - 1,
+                              int(round(target / OUT_STEP_MIN))))
 
-    dew_ok = lambda p: p["margin"] >= dew_lim
-    warm_ok = lambda p: p["warm_rate"] <= warm_lim
-    rh_ok = lambda p: abs(p["rh_rate"]) <= rh_lim
+        dew_ok = lambda p: p["margin"] >= dew_lim
+        warm_ok = lambda p: p["warm_rate"] <= warm_lim
+        rh_ok = lambda p: abs(p["rh_rate"]) <= rh_lim
 
-    for ntype, checks in (
-        ("unpack", [dew_ok, warm_ok]),
-        ("open", [dew_ok, warm_ok, rh_ok]),
-    ):
-        if ntype in nodes:
-            i0 = nearest_idx(nodes[ntype])
-            iok = _first_safe_after(series, i0, checks)
-            advice = {"planned": fmt_dt(nodes[ntype])}
-            if iok is not None:
-                t_safe = parse_dt(series[iok]["time"])
-                advice["safe_time"] = series[iok]["time"]
-                advice["wait_minutes"] = int(
-                    (t_safe - nodes[ntype]).total_seconds() / 60)
-            else:
-                advice["safe_time"] = None
-                advice["wait_minutes"] = None
-            node_advice[ntype] = advice
+        for ntype, checks in (
+            ("unpack", [dew_ok, warm_ok]),
+            ("open", [dew_ok, warm_ok, rh_ok]),
+        ):
+            if ntype in nodes:
+                i0 = nearest_idx(nodes[ntype])
+                iok = _first_safe_after(series, i0, checks)
+                advice = {"planned": fmt_dt(nodes[ntype])}
+                if iok is not None:
+                    t_safe = parse_dt(series[iok]["time"])
+                    advice["safe_time"] = series[iok]["time"]
+                    advice["wait_minutes"] = int(
+                        (t_safe - nodes[ntype]).total_seconds() / 60)
+                else:
+                    advice["safe_time"] = None
+                    advice["wait_minutes"] = None
+                node_advice[ntype] = advice
 
     # ---- 静置：进场 -> 拆外包装
     rest = None
@@ -529,7 +714,7 @@ def calculate(trip, raw_logger=None):
         rows = logger.get(cid, [])
         attach_logger(series, rows)
         gaps = logger_gaps(rows, gap_threshold)
-        ana = analyze_case(case, series, gaps)
+        ana = analyze_case(case, series, gaps, phases, t_start, t_end)
         deviation = detect_deviation(series, rows, dev_t)
         mult = None
         if deviation:

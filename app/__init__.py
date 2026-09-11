@@ -199,16 +199,18 @@ def create_app(db_path=None):
 
     @app.post("/api/trip/<code>/revision")
     def make_revision(code):
-        """从实测偏离点另建修订：偏离点之前的节点保持历史不动。"""
+        """从实测偏离点另建修订：锁定偏离点之前的历史，按拟合参数生成
+        未来节点安排；版本库为空时先封存原计划不可变快照，再存子修订。"""
+        import copy
         payload = request.get_json(force=True)
         c = conn()
         tid = trip_id_or_404(c, code)
         if tid is None:
             return jsonify({"error": "trip not found"}), 404
         doc = storage.load_document(c, tid)
-        cid = str(payload["case_id"])
-        case = next((x for x in doc.get("cases", []) if str(x["id"]) == cid),
-                    None)
+        cid = str(payload.get("case_id", ""))
+        case = next((x for x in doc.get("cases", [])
+                     if str(x["id"]) == cid), None)
         if not case:
             return jsonify({"error": "case not found"}), 404
 
@@ -217,27 +219,77 @@ def create_app(db_path=None):
         dev = co.get("deviation") if co else None
         if not dev:
             return jsonify({"error": "该箱未检测到持续偏离"}), 400
-
         t_dev = thermal.parse_dt(dev["time"])
         fitted = co.get("fitted_tau_multiplier")
-        note = (f"{cid} 实测偏离修订：偏离点 {dev['time']}，"
-                f"估算 {dev['est_temp']}°C / 实测 {dev['meas_temp']}°C；"
-                f"热响应系数拟合为 {fitted}")
 
+        phases = thermal._sorted_phases(doc)
+        t_start = phases[0]["start"]
+        t_end = thermal.parse_dt(result["domain"]["end"])
+
+        existing = storage.list_versions(c, tid)
+
+        # 1) 版本库为空：先封存偏离前的原计划（保持原 tau，不改历史）
+        if not existing:
+            plan_note = (f"原计划基线（{cid} 实测偏离前不可变快照）")
+            plan_id = storage.add_version(
+                c, tid, copy.deepcopy(doc), "plan", plan_note, None)
+            parent_id = plan_id
+        else:
+            parent_id = existing[-1]["id"]
+
+        # 2) 锁定历史节点：偏离点及之前，或已实际发生的进场/静置/封存事件；
+        #    待执行的拆外包装/开箱若在偏离点之后则留待重排。
+        locked_event_keys = {
+            (e["case_id"], e["type"]) for e in doc.get("events", [])
+        }
         for n in case.get("nodes", []):
             t_node = thermal.parse_dt(n["time"])
-            if t_node <= t_dev:
+            historical = (t_node <= t_dev or n["type"] in ("entry", "rest")
+                          or (cid, n["type"]) in locked_event_keys)
+            if historical:
                 n["locked"] = True
             else:
-                # 偏离点之后属于待重排的未来，不锁定；历史版本中仍可查
                 n.pop("locked", None)
+
+        # 3) 应用按实测拟合的热响应系数
         if fitted:
             case["tau_multiplier"] = fitted
 
-        vid = storage.add_version(c, tid, doc, "revision", note)
+        # 4) 以新模型重算待执行节点的安全时刻，生成并写入新安排
+        advice = thermal.advise_nodes(case, phases, t_start, t_end)
+        new_schedule = {}
+        for ntype in ("unpack", "open"):
+            adv = advice.get(ntype)
+            node = next((n for n in case.get("nodes", [])
+                         if n["type"] == ntype), None)
+            if (node and adv and adv.get("safe_time")
+                    and thermal.parse_dt(node["time"]) > t_dev
+                    and not node.get("locked")
+                    and node["time"] != adv["safe_time"]):
+                old_time = node["time"]
+                node["time"] = adv["safe_time"]
+                new_schedule[ntype] = {"from": old_time,
+                                       "to": adv["safe_time"]}
+
+        labels = {"unpack": "拆外包装", "open": "开箱"}
+        sched_txt = "，".join(
+            f"{labels[k]} {v['from']}→{v['to']}"
+            for k, v in new_schedule.items()) or "未来节点时刻不变"
+        note = (f"{cid} 实测偏离修订：偏离点 {dev['time']}，"
+                f"估算 {dev['est_temp']}°C / 实测 {dev['meas_temp']}°C；"
+                f"热响应系数 {case.get('tau_multiplier')}；新安排 {sched_txt}")
+
+        # 5) 子修订（父版本指向原计划基线或上一版本）
+        rev_id = storage.add_version(
+            c, tid, copy.deepcopy(doc), "revision", note, parent_id)
         storage.save_document(c, tid, doc)
+
         return jsonify({"ok": True, "deviation": dev, "note": note,
-                        "version_id": vid,
+                        "fitted_tau_multiplier":
+                            case.get("tau_multiplier"),
+                        "new_schedule": new_schedule,
+                        "plan_version_id": parent_id if not existing else None,
+                        "version_id": rev_id,
                         "versions": [_version_brief(v)
                                      for v in storage.list_versions(c, tid)]})
 
